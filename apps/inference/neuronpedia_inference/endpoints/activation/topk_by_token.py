@@ -66,7 +66,10 @@ async def activation_topk_by_token(
         )
 
     str_tokens = model.to_str_tokens(prompt, prepend_bos=prepend_bos)
-    _, cache = model.run_with_cache(tokens)
+    # Optimize: stop forward pass at the layer we need
+    layer_num = _get_layer_num_from_sae_id(source)
+    stop_at_layer = layer_num + 1 if layer_num + 1 < model.cfg.n_layers else None
+    _, cache = model.run_with_cache(tokens, stop_at_layer=stop_at_layer)
 
     hook_name = sae_manager.get_sae_hook(source)
     sae_type = sae_manager.get_sae_type(source)
@@ -110,6 +113,14 @@ async def activation_topk_by_token(
         results=results,
         tokens=str_tokens,  # type: ignore
     )
+
+
+def _get_layer_num_from_sae_id(sae_id: str) -> int:
+    """
+    Extract layer number from SAE ID.
+    Examples: "5-res-jb" -> 5, "10" -> 10
+    """
+    return int(sae_id.split("-")[0]) if not sae_id.isdigit() else int(sae_id)
 
 
 # Keep the get_activations_by_index function from the original code

@@ -88,17 +88,17 @@ async def activation_single(
             )
 
         str_tokens: list[str] = model.to_str_tokens(prompt, prepend_bos=prepend_bos)  # type: ignore
-        result = process_activations(model, source, index, tokens)
+        result, cache = process_activations_with_cache(model, source, index, tokens)
 
         # Calculate DFA if enabled
         if sae_manager.is_dfa_enabled(source):
-            dfa_result = calculate_dfa(
+            dfa_result = calculate_dfa_from_cache(
                 model,
                 sae,
                 layer_num,
                 index,
                 result.max_value_index,
-                tokens,
+                cache,
             )
             result.dfa_values = dfa_result["dfa_values"]  # type: ignore
             result.dfa_target_index = dfa_result["dfa_target_index"]  # type: ignore
@@ -127,7 +127,9 @@ async def activation_single(
             )
 
         str_tokens: list[str] = model.to_str_tokens(prompt, prepend_bos=prepend_bos)  # type: ignore
-        _, cache = model.run_with_cache(tokens)
+        # Optimize: extract layer number from hook name and stop at that layer
+        stop_at_layer = _get_stop_layer_from_hook(hook, model.cfg.n_layers)
+        _, cache = model.run_with_cache(tokens, stop_at_layer=stop_at_layer)
         result = process_vector_activations(vector, cache, hook, sae_manager.device)  # type: ignore
 
     logger.info("Returning result: %s", result)
@@ -157,25 +159,63 @@ def get_layer_num_from_sae_id(sae_id: str) -> int:
     return int(sae_id.split("-")[0]) if not sae_id.isdigit() else int(sae_id)
 
 
+def _get_stop_layer_from_hook(hook_name: str, n_layers: int) -> int | None:
+    """
+    Extract layer number from hook name and return stop_at_layer parameter.
+    Returns None if we need to run through all layers.
+
+    Examples:
+    - "blocks.5.hook_resid_post" -> 6
+    - "blocks.10.mlp.hook_post" -> 11
+    """
+    import re
+
+    pattern = r"blocks\.(\d+)\."
+    match = re.search(pattern, hook_name)
+    if match:
+        layer_num = int(match.group(1))
+        stop_at_layer = layer_num + 1
+        return stop_at_layer if stop_at_layer < n_layers else None
+    return None
+
+
 def process_activations(
     model: HookedTransformer, layer: str, index: int, tokens: torch.Tensor
 ) -> ActivationSinglePost200ResponseActivation:
+    """Legacy function for backward compatibility. Use process_activations_with_cache instead."""
+    result, _ = process_activations_with_cache(model, layer, index, tokens)
+    return result
+
+
+def process_activations_with_cache(
+    model: HookedTransformer, layer: str, index: int, tokens: torch.Tensor
+) -> tuple[ActivationSinglePost200ResponseActivation, ActivationCache]:
+    """
+    Process activations and return both the result and the cache.
+    This allows reusing the cache for DFA calculations without re-running the forward pass.
+    """
     sae_manager = SAEManager.get_instance()
-    _, cache = model.run_with_cache(tokens)
+    # Optimize: stop forward pass at the layer we need
+    layer_num = get_layer_num_from_sae_id(layer)
+    stop_at_layer = layer_num + 1 if layer_num + 1 < model.cfg.n_layers else None
+    _, cache = model.run_with_cache(tokens, stop_at_layer=stop_at_layer)
     hook_name = sae_manager.get_sae_hook(layer)
     sae_type = sae_manager.get_sae_type(layer)
 
     if sae_type == "neurons":
-        return process_neuron_activations(cache, hook_name, index, sae_manager.device)
-    if sae_manager.get_sae(layer) is not None:
-        return process_feature_activations(
+        result = process_neuron_activations(cache, hook_name, index, sae_manager.device)
+    elif sae_manager.get_sae(layer) is not None:
+        result = process_feature_activations(
             sae_manager.get_sae(layer),
             sae_type,
             cache,
             hook_name,
             index,
         )
-    raise ValueError(f"Invalid layer: {layer}")
+    else:
+        raise ValueError(f"Invalid layer: {layer}")
+
+    return result, cache
 
 
 def process_neuron_activations(
@@ -253,7 +293,25 @@ def calculate_dfa(
     max_value_index: int,
     tokens: torch.Tensor,
 ) -> dict[str, list[float] | int | float]:
+    """Legacy function for backward compatibility. Use calculate_dfa_from_cache instead."""
     _, cache = model.run_with_cache(tokens)
+    return calculate_dfa_from_cache(
+        model, sae, layer_num, index, max_value_index, cache
+    )
+
+
+def calculate_dfa_from_cache(
+    model: HookedTransformer,
+    sae: Any,
+    layer_num: int,
+    index: int,
+    max_value_index: int,
+    cache: ActivationCache,
+) -> dict[str, list[float] | int | float]:
+    """
+    Calculate DFA values from an existing activation cache.
+    This avoids re-running the forward pass when we already have the cache.
+    """
     v = cache["v", layer_num]  # [batch, src_pos, n_heads, d_head]
     attn_weights = cache["pattern", layer_num]  # [batch, n_heads, dest_pos, src_pos]
 

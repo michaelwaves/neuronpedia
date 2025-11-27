@@ -27,7 +27,8 @@ async def sae_vector(request: UtilSaeVectorPostRequest):
     sae = SAEManager.get_instance().get_sae(source)
 
     result = sae.W_enc[:, index].detach().tolist()
+    hook_name = SAEManager.get_instance().get_sae_hook(source)
 
     logger.info("Returning result: %s", result)
 
-    return UtilSaeVectorPost200Response(vector=result)
+    return UtilSaeVectorPost200Response(vector=result, hookName=hook_name)
